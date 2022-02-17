@@ -1326,31 +1326,43 @@ werr:
  *
  * When the function returns C_ERR and if 'error' is not NULL, the
  * integer pointed by 'error' is set to the value of errno just after the I/O
- * error. */
-int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+ * error.
+ *
+ * dbid is used to dump a specific database, if dbid == -1,
+ * all databases are dumpped. */
+int rdbSaveRioInternal(int req, rio *rdb, int *error, int rdbflags, int dbid, rdbSaveInfo *rsi, long *total_key_counter) {
     char magic[10];
     uint64_t cksum;
     long key_counter = 0;
+    long *p_key_counter = &key_counter;
     int j;
+
+    if (total_key_counter != NULL)
+        p_key_counter = total_key_counter;
 
     if (server.rdb_checksum)
         rdb->update_cksum = rioGenericUpdateChecksum;
     snprintf(magic,sizeof(magic),"REDIS%04d",RDB_VERSION);
     if (rdbWriteRaw(rdb,magic,9) == -1) goto werr;
     if (rdbSaveInfoAuxFields(rdb,rdbflags,rsi) == -1) goto werr;
-    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_BEFORE_RDB) == -1) goto werr;
+    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && !(req & SLAVE_REQ_RDB_EXCLUDE_MODULE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_BEFORE_RDB) == -1) goto werr;
 
     /* save functions */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) goto werr;
 
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
-        for (j = 0; j < server.dbnum; j++) {
-            if (rdbSaveDb(rdb, j, rdbflags, &key_counter) == -1) goto werr;
+        if (dbid == -1) {
+            for (j = 0; j < server.dbnum; j++) {
+                if (rdbSaveDb(rdb, j, rdbflags, p_key_counter) == -1) goto werr;
+            }
+        }
+        else {
+            if (rdbSaveDb(rdb, dbid, rdbflags, p_key_counter) == -1) goto werr;
         }
     }
 
-    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
+    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && !(req & SLAVE_REQ_RDB_EXCLUDE_MODULE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
 
     /* EOF opcode */
     if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
@@ -1365,6 +1377,18 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
 werr:
     if (error) *error = errno;
     return C_ERR;
+}
+
+/* Produces a dump of the database in RDB format sending it to the specified
+ * Redis I/O channel. On success C_OK is returned, otherwise C_ERR
+ * is returned and part of the output, or all the output, can be
+ * missing because of I/O errors.
+ *
+ * When the function returns C_ERR and if 'error' is not NULL, the
+ * integer pointed by 'error' is set to the value of errno just after the I/O
+ * error. */
+int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+    return rdbSaveRioInternal(req,rdb,error,rdbflags,-1,rsi,NULL);
 }
 
 /* This is just a wrapper to rdbSaveRio() that additionally adds a prefix
@@ -1396,8 +1420,7 @@ werr: /* Write error. */
     return C_ERR;
 }
 
-/* Save the DB on disk. Return C_ERR on error, C_OK on success. */
-int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+int rdbSaveInternal(int req, char *filename, int dbid, rdbSaveInfo *rsi, long *key_counter) {
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
     FILE *fp = NULL;
@@ -1419,12 +1442,11 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
     }
 
     rioInitWithFile(&rdb,fp);
-    startSaving(RDBFLAGS_NONE);
 
     if (server.rdb_save_incremental_fsync)
         rioSetAutoSync(&rdb,REDIS_AUTOSYNC_BYTES);
 
-    if (rdbSaveRio(req,&rdb,&error,RDBFLAGS_NONE,rsi) == C_ERR) {
+    if (rdbSaveRioInternal(req,&rdb,&error,RDBFLAGS_NONE,dbid,rsi,key_counter) == C_ERR) {
         errno = error;
         goto werr;
     }
@@ -1448,23 +1470,60 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
             cwdp ? cwdp : "unknown",
             str_err);
         unlink(tmpfile);
-        stopSaving(0);
         return C_ERR;
     }
 
-    serverLog(LL_NOTICE,"DB saved on disk");
-    server.dirty = 0;
-    server.lastsave = time(NULL);
-    server.lastbgsave_status = C_OK;
-    stopSaving(1);
     return C_OK;
 
 werr:
-    serverLog(LL_WARNING,"Write error saving DB on disk: %s", strerror(errno));
     if (fp) fclose(fp);
     unlink(tmpfile);
-    stopSaving(0);
     return C_ERR;
+}
+
+/* Save the DB on disk. Return C_ERR on error, C_OK on success. */
+int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+    int j;
+    int retval;
+    long key_counter;
+    char dstfile[256];
+
+    startSaving(RDBFLAGS_NONE);
+
+    if (!server.rdb_perdb) {
+        retval = rdbSaveInternal(req,filename,-1,rsi,&key_counter);
+    }
+    else {
+        for (j = 0; j < server.dbnum; j++) {
+            if (j == 0) {
+                snprintf(dstfile,256,"%s",filename);
+            }
+            else {
+                snprintf(dstfile,256,"%s.%d",filename,j);
+            }
+            if (j != 0) {
+                // avoid saving function and module data again.
+                req |= SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS;
+                req |= SLAVE_REQ_RDB_EXCLUDE_MODULE_DATA;
+            }
+            retval = rdbSaveInternal(req,dstfile,j,rsi,&key_counter);
+            if (retval != C_OK)
+                break;
+        }
+    }
+
+    if (retval == C_OK) {
+        serverLog(LL_NOTICE,"DB saved on disk");
+        server.dirty = 0;
+        server.lastsave = time(NULL);
+        server.lastbgsave_status = C_OK;
+    }
+    else {
+        serverLog(LL_WARNING,"Write error saving DB on disk: %s", strerror(errno));
+    }
+
+    stopSaving(retval == C_OK);
+    return retval;
 }
 
 int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi) {
@@ -3175,14 +3234,7 @@ eoferr:
     return C_ERR;
 }
 
-/* Like rdbLoadRio() but takes a filename instead of a rio stream. The
- * filename is open for reading and a rio stream object created in order
- * to do the actual loading. Moreover the ETA displayed in the INFO
- * output is initialized and finalized.
- *
- * If you pass an 'rsi' structure initialized with RDB_SAVE_OPTION_INIT, the
- * loading code will fill the information fields in the structure. */
-int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
+int rdbLoadInternal(char *filename, rdbSaveInfo *rsi, int rdbflags) {
     FILE *fp;
     rio rdb;
     int retval;
@@ -3193,13 +3245,56 @@ int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (fstat(fileno(fp), &sb) == -1)
         sb.st_size = 0;
 
-    startLoadingFile(sb.st_size, filename, rdbflags);
+    rdbFileBeingLoaded = filename;
     rioInitWithFile(&rdb,fp);
 
     retval = rdbLoadRio(&rdb,rdbflags,rsi);
 
     fclose(fp);
-    stopLoading(retval==C_OK);
+    return retval;
+}
+
+/* Like rdbLoadRio() but takes a filename instead of a rio stream. The
+ * filename is open for reading and a rio stream object created in order
+ * to do the actual loading. Moreover the ETA displayed in the INFO
+ * output is initialized and finalized.
+ *
+ * If you pass an 'rsi' structure initialized with RDB_SAVE_OPTION_INIT, the
+ * loading code will fill the information fields in the structure. */
+int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    int j;
+    char srcfile[256];
+    int retval;
+
+    // FIXME: COSMETIC. The first argument supposed to be the total size of the db file to load
+    // however since there are multiple files, it can't just based on the size of the
+    // single file, but all of them together. Instead of doing that *lazy*, just pass
+    // 0 for now. It is not critical, only purpose is to provide an accurate read for
+    // the progress of loading.
+    startLoading(0, rdbflags, 0);
+    if (!server.rdb_perdb) {
+        retval = rdbLoadInternal(filename, rsi, rdbflags);
+    }
+    else {
+        // FIXME: MODULE. When rdb per db is used, the modules are stored in the first db
+        // file. And during the load time, the module data (when: REDISMODULE_AUX_AFTER_RDB)
+        // will be restored before rdb data for other databases are restored.
+        // This might or might not be OK depending on what modules are used.
+        // It is DEFINITELY OK if no module is used at all.
+        for (j = 0; j < server.dbnum; j++) {
+            if (j == 0) {
+                snprintf(srcfile,256,"%s",filename);
+            }
+            else {
+                snprintf(srcfile,256,"%s.%d",filename,j);
+            }
+            retval = rdbLoadInternal(srcfile, rsi, rdbflags);
+            if (retval != C_OK)
+                break;
+        }
+    }
+
+    stopLoading(retval == C_OK);
     return retval;
 }
 

@@ -427,6 +427,8 @@ typedef enum {
 /* Mask of all bits in the slave requirements bitfield that represent non-standard (filtered) RDB requirements */
 #define SLAVE_REQ_RDB_MASK (SLAVE_REQ_RDB_EXCLUDE_DATA | SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS)
 
+#define SLAVE_REQ_RDB_EXCLUDE_MODULE_DATA ( 1 << 10 ) /* Exclude module data from RDB */
+
 /* Synchronous read timeout - slave side */
 #define CONFIG_REPL_SYNCIO_TIMEOUT 5
 
@@ -1662,6 +1664,7 @@ struct redisServer {
     char *rdb_filename;             /* Name of RDB file */
     int rdb_compression;            /* Use compression in RDB? */
     int rdb_checksum;               /* Use RDB checksum? */
+    int rdb_perdb;                  /* A rdb file per database? */
     int rdb_del_sync_files;         /* Remove RDB files used only for SYNC if
                                        the instance does not use persistence. */
     time_t lastsave;                /* Unix time of last successful save */

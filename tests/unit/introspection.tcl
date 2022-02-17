@@ -177,6 +177,7 @@ start_server {tags {"introspection"}} {
         # Do CONFIG GET, CONFIG SET and then CONFIG GET again
         # Skip immutable configs, one with no get, and other complicated configs
         set skip_configs {
+            rdbfileperdb
             rdbchecksum
             daemonize
             io-threads-do-reads

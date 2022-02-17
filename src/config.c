@@ -2731,6 +2731,7 @@ void rewriteConfigLatencyTrackingInfoPercentilesOutputOption(typeData data, cons
 
 standardConfig configs[] = {
     /* Bool configs */
+    createBoolConfig("rdbfileperdb", NULL, IMMUTABLE_CONFIG, server.rdb_perdb, 0, NULL, NULL),
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
     createBoolConfig("daemonize", NULL, IMMUTABLE_CONFIG, server.daemonize, 0, NULL, NULL),
     createBoolConfig("io-threads-do-reads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, server.io_threads_do_reads, 0,NULL, NULL), /* Read + parse from threads? */
